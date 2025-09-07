@@ -1,220 +1,519 @@
+# DB.py — Aurora Pro Layout (modular routing, same-tab nav, stateful page)
+# Run: streamlit run DB.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+from datetime import date
 
-st.set_page_config(page_title="No-Show Appointments Explorer", layout="wide")
+# Sub-pages
+from patients_page import render as render_patients
+from appointments_page import render as render_appointments
 
-# -------- Sidebar: Upload & Column Mapping --------
-st.sidebar.title("No-Show Appointments")
-st.sidebar.caption("Upload your CSV then map columns if names differ.")
-file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+# =================== PAGE ===================
+st.set_page_config(
+    page_title="Appointment Attendance Analytics",
+    page_icon="🗓️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# Default column names (change if your file uses different names)
-colmap_defaults = {
-    "scheduled": "ScheduledDay",
-    "appointment": "AppointmentDay",
-    "no_show": "No-show",          # values typically "Yes"/ "No"
-    "age": "Age",
-    "gender": "Gender",
-    "neighborhood": "Neighbourhood",
-    "scholarship": "Scholarship",
-    "hipertension": "Hipertension",
-    "diabetes": "Diabetes",
-    "alcoholism": "Alcoholism",
-    "handcap": "Handcap",
-    "sms": "SMS_received",
-    "patient_id": "PatientId",
+# --- Windows + older Streamlit workaround for stray asyncio RuntimeWarnings ---
+# --- Windows + older Streamlit workaround for stray asyncio RuntimeWarnings ---
+import sys, asyncio, warnings
+
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+
+# Silence: "coroutine 'expire_cache' was never awaited" from streamlit.util
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning,
+    module=r"streamlit\.util$",
+)
+
+
+
+
+# =================== THEME TOKENS ===================
+LIGHT = {
+    "bg_grad_top": "#f6f8ff", "bg_grad_mid": "#eef3ff", "bg_grad_end": "#ffffff",
+    "card": "rgba(255,255,255,.72)", "card_border": "rgba(120,130,170,.16)",
+    "ink": "#0f172a", "muted": "#667085", "primary": "#6C63FF", "primary2": "#A78BFA",
+    "accent": "#22C55E", "warn": "#F59E0B", "danger": "#EF4444",
+}
+DARK = {
+    "bg_grad_top": "#0b1020", "bg_grad_mid": "#0f172a", "bg_grad_end": "#121a31",
+    "card": "rgba(17,23,42,.64)", "card_border": "rgba(255,255,255,.08)",
+    "ink": "#e5e7eb", "muted": "#9aa3b2", "primary": "#8B7BFF", "primary2": "#7C3AED",
+    "accent": "#34D399", "warn": "#FBBF24", "danger": "#F87171",
 }
 
-def mapping_widget(df):
-    st.sidebar.markdown("### Column mapping")
-    mapped = {}
-    for k, v in colmap_defaults.items():
-        options = ["<none>"] + list(df.columns)
-        default = options.index(v) if v in df.columns else 0
-        mapped[k] = st.sidebar.selectbox(k.replace("_"," ").title(), options, index=default, key=f"map_{k}")
-        if mapped[k] == "<none>":
-            mapped[k] = None
-    return mapped
+if "dark" not in st.session_state:
+    st.session_state.dark = False
+THEME = DARK if st.session_state.dark else LIGHT
 
-@st.cache_data
-def load_df(file):
-    return pd.read_csv(file)
+# --------- small helpers for query params (new & old Streamlit) ----------
+def _qp_get(key: str):
+    try:
+        return st.query_params.get(key)
+    except Exception:
+        v = st.experimental_get_query_params().get(key)
+        return v[0] if isinstance(v, list) and v else v
 
-def safe_parse_date(s):
-    return pd.to_datetime(s, errors="coerce")
+def _qp_set(**kwargs):
+    try:
+        st.query_params.update(kwargs)
+    except Exception:
+        st.experimental_set_query_params(**kwargs)
 
-if file:
-    df_raw = load_df(file)
-    mapping = mapping_widget(df_raw)
-    df = df_raw.copy()
+# ===== Router state (keeps current page across reruns) =====
+# ONE-TIME initialization from URL (or default). Do NOT resync on every rerun.
+if "page" not in st.session_state:
+    st.session_state.page = _qp_get("page") or "overview"
 
-    # Parse dates
-    if mapping["scheduled"]:   df["scheduled"] = safe_parse_date(df[mapping["scheduled"]])
-    if mapping["appointment"]: df["appointment"] = safe_parse_date(df[mapping["appointment"]])
+def current_page() -> str:
+    return st.session_state.page
 
-    # Clean age
-    if mapping["age"]:
-        df["age"] = pd.to_numeric(df[mapping["age"]], errors="coerce")
-        df.loc[(df["age"] < 0) | (df["age"] > 120), "age"] = np.nan
+def goto(slug: str):
+    st.session_state.page = slug
+    _qp_set(page=slug)          # keep the URL in sync for deep-links
 
-    # Normalize No-show to 0/1
-    if mapping["no_show"]:
-        ns = df[mapping["no_show"]].astype(str).str.strip().str.lower()
-        df["no_show"] = np.where(ns.isin(["yes","1","true","t"]), 1,
-                           np.where(ns.isin(["no","0","false","f"]), 0, np.nan))
+# Keep URL clean/accurate every run (no effect on state)
+_qp_set(page=current_page())
 
-    # Optional binary columns
-    def bin_col(k):
-        if mapping[k]:
-            df[k] = pd.to_numeric(df[mapping[k]], errors="coerce").fillna(0).astype(int)
+# =================== GLOBAL CSS ===================
+st.markdown(f"""
+<style>
+:root {{
+  --bg-top:{THEME['bg_grad_top']}; --bg-mid:{THEME['bg_grad_mid']}; --bg-end:{THEME['bg_grad_end']};
+  --card:{THEME['card']}; --card-border:{THEME['card_border']};
+  --ink:{THEME['ink']}; --muted:{THEME['muted']};
+  --p:{THEME['primary']}; --p2:{THEME['primary2']}; --acc:{THEME['accent']};
+  --warn:{THEME['warn']}; --danger:{THEME['danger']};
+}}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
 
-    for k in ["sms","scholarship","hipertension","diabetes","alcoholism","handcap"]:
-        bin_col(k)
+html, body, [data-testid='stAppViewContainer']{{
+  font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Arial;
+  color:var(--ink);
+  background:
+    radial-gradient(1300px 780px at 12% -10%, var(--bg-top), var(--bg-mid) 40%),
+    radial-gradient(1400px 900px at 98% 0%, var(--bg-mid), var(--bg-end) 55%);
+}}
+.block-container{{max-width:1340px;padding-top:12px}}
+[data-testid='stHeader']{{background:transparent}}
 
-    # Categorical
-    if mapping["gender"]:       df["gender"] = df[mapping["gender"]].astype(str)
-    if mapping["neighborhood"]: df["neighborhood"] = df[mapping["neighborhood"]].astype(str)
-    if mapping["patient_id"]:   df["patient_id"] = df[mapping["patient_id"]].astype(str)
+.card{{background:var(--card);backdrop-filter:blur(12px);border:1px solid var(--card-border);border-radius:22px;box-shadow:0 18px 44px rgba(17,24,39,.10)}}
+.pad{{padding:18px}}
+.smallmuted{{color:var(--muted);font-size:12px}}
 
-    # Feature engineering
-    if "scheduled" in df and "appointment" in df:
-        df["lead_days"] = (df["appointment"] - df["scheduled"]).dt.days
-        df["appt_dow"] = df["appointment"].dt.day_name()
-        df["appt_date"] = df["appointment"].dt.date
-    else:
-        df["lead_days"] = np.nan
-        df["appt_dow"] = np.nan
-        df["appt_date"] = np.nan
+/* Header */
+.header-grid{{display:grid;grid-template-columns:1fr 360px 160px;gap:12px;align-items:center}}
+.search{{width:100%;padding:10px 14px;border-radius:14px;border:1px solid var(--card-border);background:rgba(255,255,255,.65)}}
 
-    if "age" in df:
-        bins = [-0.1, 0, 5, 12, 18, 30, 45, 60, 75, 120]
-        labels = ["<1","1-5","6-12","13-18","19-30","31-45","46-60","61-75","75+"]
-        df["age_band"] = pd.cut(df["age"], bins=bins, labels=labels)
+/* ===== Sidebar (website-like) ===== */
+[data-testid="stSidebar"] {{
+  padding: 16px 14px 20px;
+  background:
+    radial-gradient(420px 380px at 0 -40px, rgba(108,99,255,.12), transparent 60%),
+    linear-gradient(180deg, rgba(255,255,255,.35), rgba(255,255,255,.18));
+  backdrop-filter: blur(10px);
+  border-right: 1px solid var(--card-border);
+}}
+.sidenav{{display:flex;flex-direction:column;height:100%;gap:12px}}
+.sidenav .brand{{
+  display:flex;align-items:center;gap:10px;
+  font-weight:800;font-size:18px;padding:12px 14px;border-radius:14px;
+  background:var(--card);border:1px solid var(--card-border);
+  box-shadow:0 10px 20px rgba(17,23,42,.08)
+}}
+.sidenav .logo{{
+  width:32px;height:32px;border-radius:10px;color:#fff;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--p),var(--p2))
+}}
+.nav-section .label{{margin:10px 8px 8px;font-size:11px;color:var(--muted);letter-spacing:.02em}}
 
-    # -------- Filters --------
-    st.title("🩺 No-Show Appointments Explorer")
+/* Active pill */
+.nav-link{{
+  position:relative;display:flex;align-items:center;gap:10px;
+  padding:10px 12px;border-radius:12px;background:var(--card);
+  border:1px solid var(--card-border);color:inherit;text-decoration:none
+}}
+.nav-link.active{{
+  color:#fff;background:linear-gradient(135deg,rgba(108,99,255,.95),rgba(167,139,250,.95));
+  border-color:transparent;box-shadow:0 12px 22px rgba(108,99,255,.28)
+}}
+.nav-link.active::before{{
+  content:"";position:absolute;left:-10px;top:18%;width:4px;height:64%;
+  border-radius:6px;background:linear-gradient(var(--p),var(--p2));
+  box-shadow:0 0 0 4px rgba(108,99,255,.15)
+}}
+/* ==== Sidebar spacing (final, clean) ==== */
 
-    with st.expander("Filters", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-        # Date range
-        if df["appointment"].notna().any():
-            min_d, max_d = df["appointment"].min(), df["appointment"].max()
-            d_from, d_to = c1.date_input("Appointment from", min_d.date() if pd.notna(min_d) else None), \
-                           c2.date_input("to", max_d.date() if pd.notna(max_d) else None)
-        else:
-            d_from = d_to = None
+/* مسافة تحت عنوان Main */
+[data-testid="stSidebar"] .nav-section .label{{
+  margin: 12px 8px 12px;
+}}
 
-        # Neighborhood
-        neigh_sel = c3.multiselect("Neighbourhood", sorted(df["neighborhood"].dropna().unique())[:100]) if "neighborhood" in df else []
-        # Gender
-        gender_sel = c4.multiselect("Gender", sorted(df["gender"].dropna().unique())[:10]) if "gender" in df else []
+/* فجوة موحّدة بين عناصر الناف (active pill + buttons) */
+[data-testid="stSidebar"] .nav-link,
+[data-testid="stSidebar"] .stButton{{
+  display: block;
+  margin: 0 0 20px 0 !important;   /* غيّر 20px حسب ذوقك */
+}}
 
-        # Age range slider
-        if "age" in df and df["age"].notna().any():
-            min_a, max_a = int(np.nanmin(df["age"])), int(np.nanmax(df["age"]))
-            age_min, age_max = st.slider("Age range", min_value=min_a, max_value=max_a, value=(min_a, max_a))
-        else:
-            age_min = age_max = None
+/* نفس الفجوة للعنصر النشط */
+[data-testid="stSidebar"] .nav-link.active{{
+  margin-bottom: 20px !important;
+}}
 
-        # Binary toggles
-        t1, t2, t3, t4 = st.columns(4)
-        sms_only = t1.checkbox("SMS received = 1 filter", value=False)
-        scholarship_only = t2.checkbox("Scholarship = 1 filter", value=False)
-        chronic_only = t3.checkbox("Chronic (Hipertension/Diabetes) = 1 filter", value=False)
-        lead_cap = t4.slider("Max lead days cap (for plots)", 0, 120, 60)
+/* آخر عنصر بدون مسافة إضافية */
+[data-testid="stSidebar"] .nav-link:last-of-type,
+[data-testid="stSidebar"] .stButton:last-of-type{{
+  margin-bottom: 0 !important;
+}}
 
-    # Apply filters
-    mask = pd.Series(True, index=df.index)
-    if d_from and d_to and "appt_date" in df:
-        mask &= (pd.to_datetime(df["appt_date"]) >= pd.to_datetime(d_from)) & (pd.to_datetime(df["appt_date"]) <= pd.to_datetime(d_to))
-    if neigh_sel:
-        mask &= df["neighborhood"].isin(neigh_sel)
-    if gender_sel:
-        mask &= df["gender"].isin(gender_sel)
-    if age_min is not None:
-        mask &= df["age"].between(age_min, age_max)
-    if sms_only and "sms" in df:
-        mask &= df["sms"] == 1
-    if scholarship_only and "scholarship" in df:
-        mask &= df["scholarship"] == 1
-    if chronic_only:
-        conds = []
-        for k in ["hipertension","diabetes"]:
-            if k in df: conds.append(df[k] == 1)
-        if conds:
-            mask &= np.logical_or.reduce(conds)
+/* مسافة لطيفة فوق كرت البروفايل */
+[data-testid="stSidebar"] .profile{{
+  margin-top: 20px;
+}}
 
-    dff = df[mask].copy()
+/* أزرار الناف تُلبس نفس شكل الروابط */
+[data-testid="stSidebar"] .stButton > button{{
+  width:100%;
+  display:flex; align-items:center; gap:10px;
+  padding:10px 12px; border-radius:12px;
+  border:1px solid var(--card-border); background:var(--card);
+  color:inherit; text-align:left; transition:all .15s ease;
+}}
+[data-testid="stSidebar"] .stButton > button:hover{{
+  border-color: rgba(108,99,255,.35);
+  box-shadow: 0 6px 14px rgba(108,99,255,.12);
+  transform: translateY(-1px);
+}}
+[data-testid="stSidebar"] .stButton > button::after{{
+  content:"›"; margin-left:auto; opacity:.35; font-weight:700;
+}}
+[data-testid="stSidebar"] .stButton > button .ico{{ width:22px; text-align:center; }}
 
-    # -------- KPIs --------
-    k1, k2, k3, k4 = st.columns(4)
-    total = len(dff)
-    ns_rate = (dff["no_show"].mean()*100) if "no_show" in dff and total>0 else np.nan
-    sms_rate = dff.loc[dff.get("sms", pd.Series(dtype=int))==1, "no_show"].mean()*100 if "sms" in dff and "no_show" in dff and (dff["sms"]==1).any() else np.nan
-    schol_rate = dff.loc[dff.get("scholarship", pd.Series(dtype=int))==1, "no_show"].mean()*100 if "scholarship" in dff and "no_show" in dff and (dff["scholarship"]==1).any() else np.nan
-    avg_lead = dff["lead_days"].clip(upper=365).mean() if "lead_days" in dff else np.nan
+[data-testid="stSidebar"] .nav-link.active {{
+  margin-bottom: 18px !important;  /* optional override */
+}}
 
-    k1.metric("Appointments (filtered)", f"{total:,}")
-    k2.metric("No-Show Rate", f"{ns_rate:0.1f}%" if pd.notna(ns_rate) else "—")
-    k3.metric("No-Show w/ SMS", f"{sms_rate:0.1f}%" if pd.notna(sms_rate) else "—")
-    k4.metric("Avg Lead Days", f"{avg_lead:0.1f}" if pd.notna(avg_lead) else "—")
+/* Footer/profile */
+.sidenav .spacer{{flex:1 1 auto}}
+.profile{{
+  display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;
+  background:var(--card);border:1px solid var(--card-border)
+}}
+.profile .avatar{{
+  width:30px;height:30px;border-radius:50%;
+  background:linear-gradient(135deg,var(--p),var(--p2));
+  box-shadow:0 6px 16px rgba(108,99,255,.25)
+}}
+.profile .meta .name{{font-weight:700;font-size:12.5px}}
+.profile .meta .role{{color:var(--muted);font-size:11px}}
 
-    st.markdown("---")
+/* Layout helpers */
+.ribbon{{display:grid;gap:12px;grid-template-columns:repeat(12,1fr)}}
+@media (max-width:1200px){{.ribbon{{grid-template-columns:repeat(6,1fr)}}}}
+@media (max-width:640px){{.ribbon{{grid-template-columns:repeat(2,1fr)}}}}
+.kpi-row{{display:grid;gap:14px;grid-template-columns:repeat(4,1fr)}}
+@media (max-width:1200px){{.kpi-row{{grid-template-columns:repeat(2,1fr)}}}}
+@media (max-width:640px){{.kpi-row{{grid-template-columns:1fr}}}}
+.kpi{{display:flex;gap:12px;align-items:center}}
+.kpi .ico{{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,var(--p),var(--p2));box-shadow:0 10px 20px rgba(124,58,237,.25)}}
+.kpi .num{{font-size:28px;font-weight:800}}
+.kpi .lbl{{font-size:12px;color:var(--muted);margin-top:-6px}}
+.grid-2{{display:grid;gap:16px;grid-template-columns:2fr 1fr}}
+@media (max-width:1200px){{.grid-2{{grid-template-columns:1fr}}}}
+.section-title{{font-weight:800;margin-bottom:8px}}
 
-    # -------- Visuals --------
-    # 1) No-show by Day of Week
-    if "appt_dow" in dff and "no_show" in dff:
-        order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-        tmp = dff.groupby("appt_dow")["no_show"].mean().mul(100).reindex(order)
-        fig = px.bar(tmp, labels={"value":"No-Show %","index":"Appointment DOW"}, text=tmp.round(1))
-        fig.update_traces(textposition="outside")
-        st.plotly_chart(fig, use_container_width=True)
+/* Soft noise layer */
+[data-testid='stAppViewContainer']::before{{
+  content:"";position:fixed;inset:0;pointer-events:none;opacity:.32;mix-blend-mode:soft-light;
+  background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" stitchTiles="stitch"/></filter><rect width="100%" height="100%" filter="url(#n)" opacity=".015"/></svg>')
+}}
+</style>
+""", unsafe_allow_html=True)
 
-    # 2) Lead time vs no-show
-    if "lead_days" in dff and "no_show" in dff:
-        dd = dff.copy()
-        dd = dd[(dd["lead_days"] >= 0) & (dd["lead_days"] <= lead_cap)]
-        if len(dd):
-            fig2 = px.histogram(dd, x="lead_days", color="no_show",
-                                barmode="group", marginal="box",
-                                labels={"lead_days":"Lead Days","no_show":"No-Show (1=yes)"})
-            st.plotly_chart(fig2, use_container_width=True)
 
-    # 3) Age band no-show rate
-    if "age_band" in dff and "no_show" in dff:
-        tmp2 = dff.groupby("age_band")["no_show"].mean().mul(100)
-        fig3 = px.bar(tmp2, labels={"value":"No-Show %","index":"Age Band"}, text=tmp2.round(1))
-        fig3.update_traces(textposition="outside")
-        st.plotly_chart(fig3, use_container_width=True)
+# =================== SIDEBAR ===================
+def render_sidebar():
+    active = current_page()
 
-    # 4) Neighborhood top/bottom
-    if "neighborhood" in dff and "no_show" in dff:
-        ns_by_n = dff.groupby("neighborhood")["no_show"].mean().mul(100).sort_values(ascending=False)
-        st.subheader("Neighbourhoods by No-Show %")
-        st.write(ns_by_n.head(10).round(1).to_frame("No-Show %"))
+    items = [
+        ("overview",     "Overview",     "🏠"),
+        ("patients",     "Patients",     "👥"),
+        ("appointments", "Appointments", "📅"),
+    ]
 
-    # 5) SMS / Scholarship impact
-    cols = []
-    if "sms" in dff: cols.append("sms")
-    if "scholarship" in dff: cols.append("scholarship")
-    if cols and "no_show" in dff:
-        st.subheader("Binary Factors Impact")
-        tbl = dff.groupby(cols)["no_show"].mean().mul(100).round(1).to_frame("No-Show %")
-        st.write(tbl)
-
-    # Raw preview
-    with st.expander("Raw filtered data"):
-        st.dataframe(dff.head(200), use_container_width=True)
-
-else:
-    st.title("🩺 No-Show Appointments Explorer")
-    st.write("Upload your **appointments CSV** from the left sidebar to begin.")
-    st.markdown(
-        """
-        **Expected columns (typical names, can be remapped):**  
-        `ScheduledDay`, `AppointmentDay`, `No-show`, `Age`, `Gender`, `Neighbourhood`,  
-        `Scholarship`, `Hipertension`, `Diabetes`, `Alcoholism`, `Handcap`, `SMS_received`.
-        """
+    # Brand
+    st.sidebar.markdown(
+        "<aside class='sidenav'>"
+        "<div class='brand'><div class='logo'>🩺</div><div>Medical Data analysis</div></div>",
+        unsafe_allow_html=True,
     )
+
+    # Group label
+    st.sidebar.markdown("<div class='nav-section'><div class='label'>Main</div></div>", unsafe_allow_html=True)
+
+    # Buttons / active pill
+    box = st.sidebar.container()
+    with box:
+        st.markdown("<div class='sidebar-nav'>", unsafe_allow_html=True)
+        for slug, label, icon in items:
+            if slug == active:
+                st.markdown(
+                    f"<div class='nav-link active'><span class='ico'>{icon}</span>{label}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.button(
+                    f"{icon}  {label}",
+                    key=f"nav_{slug}",
+                    use_container_width=True,
+                    on_click=goto,
+                    args=(slug,),
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Footer/profile
+    st.sidebar.markdown(
+        "<div class='spacer'></div>"
+        "<div class='profile'><div class='avatar'></div>"
+        "<div class='meta'><div class='name'>Rawand Radi</div><div class='role'>Analyst</div></div>"
+        "</div></aside>",
+        unsafe_allow_html=True,
+    )
+
+render_sidebar()
+
+# =================== DATA ===================
+@st.cache_data
+def load_data():
+    try:
+        df = pd.read_csv("noshowappointments-kagglev2-may-2016.csv")
+    except Exception:
+        rng = np.random.default_rng(13); n = 1400
+        df = pd.DataFrame({
+            "PatientId": rng.integers(1_000_000,9_999_999,n),
+            "AppointmentID": rng.integers(10_000_000,99_999_999,n),
+            "Gender": rng.choice(["F","M"], n, p=[0.65,0.35]),
+            "ScheduledDay": pd.date_range(date(2016,1,1), periods=n, freq="D", tz="UTC"),
+            "AppointmentDay": pd.date_range(date(2016,1,1), periods=n, freq="D", tz="UTC"),
+            "Age": np.clip(rng.normal(39,16,n).astype(int), 0, 95),
+            "Neighbourhood": rng.choice(["Centro","Jardim","Maria Ortiz","Sao Pedro","Resistencia","Tabuazeiro"], n),
+            "Scholarship": rng.integers(0,2,n),
+            "Hipertension": rng.integers(0,2,n, p=[0.75,0.25]),
+            "Diabetes": rng.integers(0,2,n, p=[0.85,0.15]),
+            "Alcoholism": rng.integers(0,2,n, p=[0.92,0.08]),
+            "Handcap": rng.choice([0,1], n, p=[0.93,0.07]),
+            "SMS_received": rng.integers(0,2,n, p=[0.45,0.55]),
+            "No-show": rng.choice(["No","Yes"], n, p=[0.80,0.20]),
+        })
+
+    # Normalize dtypes & drop tz (prevents tz-aware/naive subtraction issues)
+    df["ScheduledDay"] = pd.to_datetime(df["ScheduledDay"], errors="coerce")
+    df["AppointmentDay"] = pd.to_datetime(df["AppointmentDay"], errors="coerce")
+    for col in ["ScheduledDay", "AppointmentDay"]:
+        try:
+            df[col] = df[col].dt.tz_localize(None)
+        except TypeError:
+            pass
+
+    df["AppointmentDate"] = df["AppointmentDay"].dt.date
+    df["Month"] = df["AppointmentDay"].dt.to_period("M").astype(str)
+    df["Weekday"] = df["AppointmentDay"].dt.day_name()
+    df["Show"] = np.where(df["No-show"].astype(str).str.upper().eq("NO"), 1, 0)
+    df["NoShow"] = 1 - df["Show"]
+    return df
+
+DF = load_data()
+
+# =================== HEADER ===================
+with st.container():
+    st.markdown(
+        "<div class='card pad header-grid'>"
+        "<div><div style='font-weight:800;font-size:22px'>Appointment Attendance Analytics</div>"
+        "<div class='smallmuted' style='margin-top:-6px'>Dashboard</div></div>"
+        "<input class='search' placeholder='Search metrics, patients, neighborhoods…'>"
+        "</div>", unsafe_allow_html=True)
+
+# =================== FILTER RIBBON ===================
+with st.container():
+    st.markdown("<div class='card pad'><div class='ribbon'>", unsafe_allow_html=True)
+    c1,c2,c3,c4,c5 = st.columns([2.4,1.4,1.2,1.8,1.2])
+    with c1:
+        min_d, max_d = DF["AppointmentDate"].min(), DF["AppointmentDate"].max()
+        start, end = st.date_input("Date range", (min_d, max_d))
+    with c2:
+        genders = st.multiselect("Gender", sorted(DF["Gender"].dropna().unique()))
+    with c3:
+        sms_sel = st.selectbox("SMS", ("All","Yes","No"))
+    with c4:
+        nb = st.multiselect("Neighborhood", sorted(DF["Neighbourhood"].dropna().unique()))
+    with c5:
+        a_min, a_max = int(DF["Age"].min()), int(DF["Age"].max())
+        age_range = st.slider("Age", min_value=a_min, max_value=a_max, value=(a_min, a_max))
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+# Shared filter for all pages
+mask = (DF["AppointmentDate"] >= start) & (DF["AppointmentDate"] <= end)
+if genders: mask &= DF["Gender"].isin(genders)
+if sms_sel != "All": mask &= DF["SMS_received"].eq(1 if sms_sel == "Yes" else 0)
+if nb: mask &= DF["Neighbourhood"].isin(nb)
+mask &= DF["Age"].between(*age_range)
+F = DF.loc[mask].copy()
+
+# =================== OVERVIEW (function) ===================
+def render_overview(F: pd.DataFrame, THEME: dict):
+    def sparkline(series, color):
+        s = pd.Series(series)
+        if s.size == 0:
+            s = pd.Series([0])
+        fig = px.area(y=s, height=90)
+        fig.update_traces(mode="lines", line_shape="spline",
+                          line_color=color, fill="tozeroy", hoverinfo="skip")
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0),
+                          paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(0,0,0,0)")
+        return fig
+
+    def kpi_with_spark(icon, value, label, series, color, delta=None, good=True):
+        d_html = ""
+        if delta is not None:
+            pos = (good and delta >= 0) or (not good and delta < 0)
+            d_html = (
+                f"<div class='smallmuted' style='margin-top:2px;"
+                f"color:{THEME['accent'] if pos else THEME['danger']}'>{delta:+.1f}%</div>"
+            )
+        st.markdown(
+            f"<div class='card pad kpi'><div class='ico'>{icon}</div>"
+            f"<div><div class='num'>{value}</div>{d_html}"
+            f"<div class='lbl'>{label}</div></div></div>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            sparkline(series, color),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+
+    trend_month = F.groupby("Month", observed=True).size()
+
+    st.markdown("<div class='kpi-row'>", unsafe_allow_html=True)
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        kpi_with_spark("📅", f"{len(F):,}", "Appointments",
+                       trend_month.values[-12:], THEME["primary"])
+    with k2:
+        ns_rate = (F["NoShow"].mean() * 100) if len(F) else 0.0
+        rolling_ns = (1 - F["Show"].rolling(20).mean().dropna()).values[-20:]
+        kpi_with_spark("🚫", f"{ns_rate:.1f}%", "No-Show Rate",
+                       rolling_ns, THEME["warn"], good=False)
+    with k3:
+        sms_pct = (F["SMS_received"].mean() * 100) if len(F) else 0.0
+        kpi_with_spark("✉️", f"{sms_pct:.0f}%", "Received SMS",
+                       F["SMS_received"].rolling(25).mean().dropna().values[-25:],
+                       THEME["accent"])
+    with k4:
+        avg_age = (F["Age"].mean()) if len(F) else 0.0
+        kpi_with_spark("👤", f"{avg_age:.0f}", "Avg Age (yrs)",
+                       F["Age"].rolling(25).mean().dropna().values[-25:],
+                       THEME["primary2"])
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.container():
+        st.markdown("<div class='grid-2'>", unsafe_allow_html=True)
+        left, right = st.columns([2, 1])
+
+        with left:
+            by_show = (
+                F["No-show"].value_counts()
+                .rename({'No': 'Show', 'Yes': 'No-Show'})
+                .reset_index()
+            )
+            by_show.columns = ["Status", "Count"]
+            fig1 = px.pie(
+                by_show,
+                names="Status",
+                values="Count",
+                hole=0.72,
+                color="Status",
+                color_discrete_map={"Show": THEME["primary"], "No-Show": THEME["warn"]},
+            )
+            fig1.update_traces(textposition="inside", textinfo="percent+label", pull=[0, 0.06])
+            st.markdown(
+                "<div class='card pad'><div class='section-title'>Attendance Breakdown</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(fig1, use_container_width=True, config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            trend_area = trend_month.reset_index(name="Appointments")
+            fig3 = px.area(trend_area, x="Month", y="Appointments",
+                           color_discrete_sequence=[THEME["primary"]])
+            fig3.update_traces(mode="lines", line_shape="spline")
+            st.markdown(
+                "<div class='card pad' style='margin-top:16px'><div class='section-title'>Appointments Over Time</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(fig3, use_container_width=True, config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with right:
+            sms = (
+                F.groupby("SMS_received", observed=True)["NoShow"]
+                .mean().mul(100)
+                .rename({0: "No SMS", 1: "SMS Sent"})
+                .reset_index()
+            )
+            sms.columns = ["SMS", "No-Show %"]
+            fig2 = px.bar(
+                sms,
+                x="SMS",
+                y="No-Show %",
+                text="No-Show %",
+                color="SMS",
+                color_discrete_sequence=[THEME["primary"], THEME["accent"]],
+            )
+            fig2.update_traces(texttemplate="%{text:.1f}%", textposition="outside", marker_line_width=0)
+            st.markdown("<div class='card pad'><div class='section-title'>Effect of SMS</div>",
+                        unsafe_allow_html=True)
+            st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.container():
+        st.markdown("<div class='card pad'><div class='section-title'>Details</div>", unsafe_allow_html=True)
+        cols = ["AppointmentID","PatientId","AppointmentDate","Gender","Age","Neighbourhood","SMS_received","Scholarship","No-show"]
+        st.dataframe(F[cols].head(250), use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# =================== ROUTER ===================
+page = current_page()
+if page == "patients":
+    render_patients(F, THEME)
+elif page == "appointments":
+    render_appointments(F, THEME)
+else:
+    render_overview(F, THEME)
+
+# =================== FOOTER & TOGGLES ===================
+st.markdown("<div class='smallmuted' style='text-align:center;padding:14px'>Aurora Layout • unified CSS • same-tab nav • stateful theme</div>", unsafe_allow_html=True)
+
+# =============== THEME TOGGLE (preserve current page) ===============
+if st.button("🌙 Dark" if not st.session_state.dark else "☀️ Light"):
+    st.session_state.dark = not st.session_state.dark
+    # do not touch page; URL already set above
+    st.rerun()
+
